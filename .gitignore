@@ -4,6 +4,8 @@
 /.firecrawl
 .superpowers
 
+.txt/
+
 # Android build outputs / local config
 android/.gradle/
 android/.kotlin/
