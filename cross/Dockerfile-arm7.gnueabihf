@@ -1,0 +1,12 @@
+# Cross build container for armv7-unknown-linux-gnueabihf
+FROM ubuntu:22.04
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+       build-essential \
+             gcc-arm-linux-gnueabihf \
+                   libc6-dev-armhf-cross \
+                         ca-certificates \
+                          && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
