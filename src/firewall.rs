@@ -83,9 +83,12 @@ use tokio_util::sync::CancellationToken;
 
 mod packet;
 
+pub use packet::{
+    FragmentKey, IPV6_EXTENSION_HEADERS, Ipv6Fragment, PacketInfo, is_link_scoped_v6,
+    parse_ipv6_fragment, parse_packet_info,
+};
 #[cfg(test)]
 pub(crate) use packet::{IPV6_AH, IPV6_FRAGMENT};
-pub use packet::{IPV6_EXTENSION_HEADERS, PacketInfo, parse_packet_info};
 
 // Direction / Protocol / Action live in `ray-proto` so the IPC layer carries them
 // typed (not stringified); re-exported here so the daemon keeps its original
@@ -311,6 +314,27 @@ impl Default for FirewallConfig {
             // removable rule rather than a hard-coded special case.
             rules: vec![default_icmp_rule()],
         }
+    }
+}
+
+impl FirewallConfig {
+    /// Follow a network renamed on this node from `from` to `to`: rules scoped
+    /// to it and rules installed from its suggestions name it by its local name,
+    /// and without this a scoped rule would stop matching while the suggested
+    /// ones were never replaced again. Returns whether any rule named it.
+    pub fn rename_network(&mut self, from: &str, to: &str) -> bool {
+        let mut renamed = false;
+        for rule in &mut self.rules {
+            if rule.network.as_deref() == Some(from) {
+                rule.network = Some(to.to_string());
+                renamed = true;
+            }
+            if matches!(&rule.origin, RuleOrigin::Network(n) if n == from) {
+                rule.origin = RuleOrigin::Network(to.to_string());
+                renamed = true;
+            }
+        }
+        renamed
     }
 }
 
@@ -667,6 +691,17 @@ impl SharedFirewall {
         config.rules.extend(new_rules);
         self.update(config.clone());
         config
+    }
+
+    /// [`FirewallConfig::rename_network`] on the live rules. Returns the updated
+    /// config for persistence, or `None` when no rule names the network.
+    pub fn rename_network(&self, from: &str, to: &str) -> Option<FirewallConfig> {
+        let mut config = (*self.get_config()).clone();
+        if !config.rename_network(from, to) {
+            return None;
+        }
+        self.update(config.clone());
+        Some(config)
     }
 
     /// Install or remove the auto-seeded SSH passthrough rule
@@ -1196,15 +1231,15 @@ mod tests {
         );
     }
 
-    /// Every fragment is refused, whichever end of the datagram it is.
+    /// Every fragment is refused as a whole packet, whichever end of the
+    /// datagram it is.
     ///
     /// The later ones have to be: they carry no L4 header, so keying them meant
     /// inventing `(44, 0, 0)`, which is the wildcard this whole walk exists to
-    /// stop. The first one is refused for a different reason. It *can* be
-    /// classified, but the only thing that buys is permission to forward one
-    /// fragment of a datagram whose remaining fragments are dropped: the peer
-    /// holds an incomplete reassembly until it times out, and outbound we would
-    /// have opened a conntrack entry for a datagram that can never complete.
+    /// stop. The first one could be classified, but on its own it only buys
+    /// permission to forward one fragment of a datagram whose siblings are
+    /// dropped. Fragments take their own path instead (`parse_ipv6_fragment`,
+    /// then `forward::frag_verdicts`), where the first decides for the rest.
     #[test]
     fn every_fragment_of_a_datagram_is_refused() {
         // Fragment header (8 octets), then TCP at 48. Offset 0, more-fragments
@@ -2889,6 +2924,45 @@ mod tests {
         assert_eq!(prod.len(), 1);
         assert_eq!(prod[0].action, Action::Deny);
         assert_eq!(prod[0].peer, PeerFilter::Any);
+    }
+
+    /// A network renamed on this node keeps its rules: the ones scoped to it
+    /// and the ones installed from its suggestions follow the new name, while
+    /// local rules and other networks' rules stay as they were.
+    #[test]
+    fn renaming_a_network_moves_its_rules_to_the_new_name() {
+        let rule = |network: Option<&str>, origin: RuleOrigin| FirewallRule {
+            direction: Direction::In,
+            action: Action::Deny,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 22, end: 22 }),
+            peer: PeerFilter::Any,
+            network: network.map(str::to_string),
+            origin,
+        };
+        let suggested = |net: &str| RuleOrigin::Network(net.to_string());
+        let fw = SharedFirewall::new(FirewallConfig {
+            rules: vec![
+                rule(Some("home"), RuleOrigin::Local),
+                rule(Some("home"), suggested("home")),
+                rule(None, suggested("home")),
+                rule(Some("work"), suggested("work")),
+                rule(None, RuleOrigin::Local),
+            ],
+            ..FirewallConfig::default()
+        });
+
+        let renamed = fw.rename_network("home", "lab").unwrap();
+        let expected = vec![
+            rule(Some("lab"), RuleOrigin::Local),
+            rule(Some("lab"), suggested("lab")),
+            rule(None, suggested("lab")),
+            rule(Some("work"), suggested("work")),
+            rule(None, RuleOrigin::Local),
+        ];
+        assert_eq!(renamed.rules, expected);
+        assert_eq!(fw.get_config().rules, expected);
+        assert!(fw.rename_network("home", "office").is_none());
     }
 
     #[test]

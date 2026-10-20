@@ -5,8 +5,8 @@
 //! `drive_mesh_connection` builds one [`MeshConnection`] per connection and runs
 //! it for the connection's whole lifetime: it demuxes each
 //! [`control::ControlFrame`] to the per-network handler named by `frame.net`,
-//! handles connection-level messages (`NetworkHandles`, `Ping`/`Pong`,
-//! `Unpaired`, `CertRefresh`) inline, and owns the connection's single data
+//! handles connection-level messages (`NetworkHandles`, `Ping`/`Pong`, the
+//! unpair notices, `CertRefresh`) inline, and owns the connection's single data
 //! reader (which forwards datagrams to the TUN via `tun_tx`).
 //!
 //! `ConnectionManager` owns the per-network handler registry (keyed by network
@@ -100,9 +100,9 @@ impl ConnectionManager {
             tracing::error!("mesh dispatch not set; dropping connection");
             return;
         };
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if !pre_registered && mesh.ctx.registry.transport.is_suspended() {
-            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"android idle");
+            conn.close(VarInt::from_u32(forward::IDLE_CODE), b"idle");
             return;
         }
         MeshConnection::new(
