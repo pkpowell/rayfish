@@ -8,9 +8,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Linux: `ray rootless` runs without administrator privileges, with private state,
+  authenticated SOCKS5 and HTTP proxies (including HTTPS through CONNECT),
+  TCP forwarding and explicit service exposure.
+  Startup prints connection instructions. Commands automatically use your running
+  rootless instance; `--system` selects the system daemon and `--rootless` selects
+  your private instance explicitly.
+
 - macOS connection logs include startup timings to help diagnose slow connections.
 - iOS 18: a Rayfish control turns the VPN on and off from Control Center,
   the Lock Screen or the Action button.
+
+### Changed
+
+- The mesh protocol is now version 7, so that a device is told which pairing
+  an unpair ends. Peers on versions 6 and 5 still connect.
+- macOS: Install shell command shows a green confirmation when it succeeds and
+  highlights the error when it fails.
+
+### Fixed
+
+- SSH connections denied by the mesh firewall fail immediately instead of hanging.
+- TCP replies remain allowed after closing the write half of a connection.
+  Tracking expires after both sides close, while resets remove it immediately.
+
+- Linux rootless mode preserves GUI instance selection, reports SOCKS failures
+  and adapts TCP traffic to smaller mesh paths. Network changes leave host DNS
+  untouched, and private instances do not expose peer metrics.
+
+- Direct connections keep retrying after approval if joining the network fails
+  temporarily.
+- illumos: remove stale tunnel interfaces after shutdown and before restarting
+  after a crash.
+- Unpairing no longer depends on the device and its primary being connected at
+  that moment, which on-demand mode makes rare. A device that unpairs itself,
+  such as a phone in the Android app, keeps asking its primary to revoke it,
+  across restarts, until the primary confirms that the revocation is saved.
+  `ray unpair <device>` keeps telling the device to delete its certificate until
+  the device confirms, so a device that was offline gets the message later. An
+  unpair interrupted by a restart is finished at the next start. A missed
+  message used to leave the device's certificate unrevoked, or still on the
+  device. A device paired again keeps the new pairing when a message about the
+  earlier one arrives late. Pairing a device again now completes only once the
+  primary's networks have stopped listing it as revoked, so that joining them
+  right away does not undo the new pairing; if that takes longer than 10
+  seconds, or one of those networks is not running, the pairing fails and can
+  be tried again. A primary on an older release gets the earlier one-shot
+  request.
 
 ## [0.5.10] - 2026-10-19
 
@@ -81,25 +125,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ray connect` takes the peer's identity, shown by `ray status` and
   `ray identityof`. Contact ids and `ray contact` are removed. A node on 0.5.9
   cannot `ray connect` to a newer one until it upgrades.
-- The mesh protocol is now version 7, so that a device is told which pairing
-  an unpair ends. Peers on versions 6 and 5 still connect.
 
 ### Fixed
 
-- Unpairing no longer depends on the device and its primary being connected at
-  that moment, which on-demand mode makes rare. A device that unpairs itself,
-  such as a phone in the Android app, keeps asking its primary to revoke it,
-  across restarts, until the primary confirms that the revocation is saved.
-  `ray unpair <device>` keeps telling the device to delete its certificate until
-  the device confirms, so a device that was offline gets the message later. An
-  unpair interrupted by a restart is finished at the next start. A missed
-  message used to leave the device's certificate unrevoked, or still on the
-  device. A device paired again keeps the new pairing when a message about the
-  earlier one arrives late. Pairing a device again now completes only once the
-  primary's networks have stopped listing it as revoked, so that joining them
-  right away does not undo the new pairing; if that takes longer than 10
-  seconds, the pairing fails and can be tried again. A primary on an older
-  release gets the earlier one-shot request.
 - Android: error messages say what went wrong instead of showing `v1=...` or
   nothing.
 - After pairing, a new device joins all of its networks at once instead of
