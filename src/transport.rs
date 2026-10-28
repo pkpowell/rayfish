@@ -3,6 +3,7 @@
 //! One iroh [`Endpoint`] handles all networks. Mesh ALPNs select the wire
 //! version; network selection happens inside each connection.
 
+use std::collections::HashSet;
 use std::io::{self, ErrorKind};
 use std::iter;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -10,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     address_lookup::{PkarrPublisher, PkarrResolver},
     dns::{DnsResolver, NameserverConfig},
     endpoint::Connection,
@@ -145,10 +146,16 @@ pub fn mesh_alpns() -> Vec<Vec<u8>> {
 /// the mesh or the names on it goes here. An operator who names their own
 /// upstreams with `replace` gets exactly those instead (see
 /// [`control_plane_nameservers`]).
-const PUBLIC_FALLBACK_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+const PUBLIC_FALLBACK_DNS: [IpAddr; 4] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+];
 
 /// At most this many nameservers are handed to the endpoint, so a host with a
-/// long resolv.conf doesn't turn every lookup into a fan-out.
+/// long resolv.conf doesn't turn every lookup into a fan-out. Keep at least one
+/// server from each family when both are available.
 const MAX_CONTROL_PLANE_NAMESERVERS: usize = 4;
 
 /// The nameservers the daemon uses for its *own* lookups: the operator's
@@ -169,24 +176,33 @@ const MAX_CONTROL_PLANE_NAMESERVERS: usize = 4;
 /// has none: with nothing configured either, the answer is an empty list and the
 /// caller leaves iroh's own reader in place. Naming a public server there would
 /// step over Android's Private DNS and downgrade those lookups to cleartext.
-fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<Ipv4Addr>>) -> Vec<Ipv4Addr> {
+fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) -> Vec<IpAddr> {
     if system.is_none() && o.servers.is_empty() {
         return Vec::new();
     }
-    let system = system.unwrap_or_default().into_iter().map(IpAddr::V4);
-    let mut out: Vec<Ipv4Addr> = crate::config::resolve_upstreams(o, system.collect())
-        .into_iter()
-        .filter_map(|ip| match ip {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
-        })
-        .collect();
+    let mut out = crate::config::resolve_upstreams(o, system.unwrap_or_default());
     if !o.replace {
         out.extend(PUBLIC_FALLBACK_DNS);
     }
-    let mut seen = std::collections::HashSet::new();
-    out.retain(|ip| !crate::membership::is_cgnat_range(*ip) && seen.insert(*ip));
+    let mut seen = HashSet::new();
+    out.retain(|ip| {
+        !crate::membership::is_overlay_ip(*ip)
+            && !matches!(ip, IpAddr::V4(v4) if crate::membership::is_cgnat_range(*v4))
+            && !is_foreign_overlay_ip(*ip)
+            && seen.insert(*ip)
+    });
+    let other_family = out.first().and_then(|first| {
+        out.iter()
+            .copied()
+            .find(|ip| ip.is_ipv4() != first.is_ipv4())
+    });
     out.truncate(MAX_CONTROL_PLANE_NAMESERVERS);
+    if let Some(ip) = other_family
+        && out.iter().all(|kept| kept.is_ipv4() != ip.is_ipv4())
+    {
+        out.truncate(MAX_CONTROL_PLANE_NAMESERVERS - 1);
+        out.push(ip);
+    }
     out
 }
 
@@ -226,6 +242,7 @@ pub async fn create_endpoint_with_alpns(
         relay: &settings.relay,
         discovery: &settings.discovery_dns,
         nameservers: &nameservers,
+        dns_replace: settings.dns_upstreams.replace,
         warm_lookup: &warm_lookup,
         quic_engine: settings.quic_engine,
     };
@@ -258,7 +275,8 @@ struct BindConfig<'a> {
     tor: bool,
     relay: &'a ServerOverride,
     discovery: &'a ServerOverride,
-    nameservers: &'a [Ipv4Addr],
+    nameservers: &'a [IpAddr],
+    dns_replace: bool,
     warm_lookup: &'a MemoryLookup,
     quic_engine: QuicEngine,
 }
@@ -282,6 +300,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         relay,
         discovery,
         nameservers,
+        dns_replace,
         warm_lookup,
         quic_engine,
     } = *cfg;
@@ -328,19 +347,18 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
     // it exists to bring up. Not setting `with_system_defaults` is deliberate:
     // the resolver never reads the file, so neither can come back.
     //
-    // Empty means we had no way to read the host's resolvers (Android reads them
-    // over JNI, and its own resolver honours the device's Private DNS), so leave
-    // iroh's default in place there.
-    if !nameservers.is_empty() {
-        builder = builder.dns_resolver(
-            DnsResolver::builder()
-                .add_nameserver_configs(
-                    nameservers
-                        .iter()
-                        .map(|ip| NameserverConfig::udp(IpAddr::V4(*ip))),
-                )
-                .build(),
-        );
+    // Without an override, empty means the platform owns resolver selection
+    // (Android reads it over JNI and honours Private DNS). An explicit replace
+    // still applies when filtering leaves no usable servers.
+    if !nameservers.is_empty() || dns_replace {
+        let mut resolver = DnsResolver::builder()
+            .add_nameserver_configs(nameservers.iter().copied().map(NameserverConfig::udp));
+        if dns_replace {
+            // Honour an explicit replacement even when every entry was an
+            // overlay address. DNS failure must not select a public resolver.
+            resolver = resolver.disable_fallback();
+        }
+        builder = builder.dns_resolver(resolver.build());
     }
 
     // Loop prevention for the exit-node client full-tunnel: keep iroh's own sockets
@@ -634,6 +652,36 @@ pub(crate) fn is_alpn_mismatch(err: &str) -> bool {
     e.contains("known protocol") || e.contains("application protocol")
 }
 
+/// Heuristic: did a connect fail because whoever answered is not the endpoint
+/// we dialed? iroh surfaces this as rustls' "invalid peer certificate"
+/// (`UnknownIssuer`), since TLS pins the endpoint id. Matched on the message for
+/// the same reason as [`is_alpn_mismatch`].
+///
+/// It means a direct address we hold for the peer now reaches someone else,
+/// typically a NAT mapping that moved to another device. iroh sends the first
+/// handshake packet to every known path at once, so that one stale address
+/// fails the whole dial even when the relay path would have worked.
+pub(crate) fn is_wrong_peer(err: &str) -> bool {
+    err.to_lowercase().contains("invalid peer certificate")
+}
+
+/// Drop `peer`'s direct addresses from the warm lookup, keeping its relay. See
+/// [`is_wrong_peer`]: without the stale address, the next dial reaches the peer
+/// through the relay and holepunching finds its current direct path.
+pub(crate) fn forget_direct_hints(lookup: &MemoryLookup, peer: EndpointId) {
+    let Some(info) = lookup.remove_endpoint_info(peer) else {
+        return;
+    };
+    let relays: Vec<TransportAddr> = EndpointAddr::from(info)
+        .addrs
+        .into_iter()
+        .filter(TransportAddr::is_relay)
+        .collect();
+    if !relays.is_empty() {
+        lookup.add_endpoint_info(EndpointAddr::from_parts(peer, relays));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,13 +768,22 @@ mod tests {
     /// in place waits on the data plane it is trying to bring up.
     #[test]
     fn control_plane_never_points_at_an_overlay_resolver() {
-        let magic = crate::dns::MAGIC_DNS_V4;
-        let tailnet: Ipv4Addr = "100.100.100.100".parse().unwrap();
-        let got = control_plane_nameservers(&ServerOverride::default(), Some(vec![magic, tailnet]));
-        assert!(!got.contains(&magic));
-        assert!(!got.contains(&tailnet));
-        // And it still has somewhere to ask.
-        assert!(!got.is_empty());
+        let overlays: Vec<IpAddr> = [
+            "100.100.100.53",
+            "100.100.100.100",
+            "200::53",
+            "200::1",
+            "fd7a:115c:a1e0::53",
+        ]
+        .map(|ip| ip.parse().unwrap())
+        .to_vec();
+        let got = control_plane_nameservers(&ServerOverride::default(), Some(overlays.clone()));
+        assert_eq!(got, PUBLIC_FALLBACK_DNS);
+        let configured = ServerOverride {
+            servers: overlays.iter().map(ToString::to_string).collect(),
+            replace: true,
+        };
+        assert!(control_plane_nameservers(&configured, None).is_empty());
     }
 
     #[test]
@@ -745,7 +802,7 @@ mod tests {
 
         // Unless the operator named servers, which is an explicit instruction
         // and applies on every platform.
-        let custom: Ipv4Addr = "9.9.9.9".parse().unwrap();
+        let custom: IpAddr = "9.9.9.9".parse().unwrap();
         let o = ServerOverride {
             servers: vec![custom.to_string()],
             replace: false,
@@ -755,16 +812,16 @@ mod tests {
 
     #[test]
     fn control_plane_prefers_the_host_then_the_fallback() {
-        let lan: Ipv4Addr = "192.168.1.1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.1".parse().unwrap();
         let got = control_plane_nameservers(&ServerOverride::default(), Some(vec![lan]));
         assert_eq!(got[0], lan, "the host's own resolver is asked first");
-        assert_eq!(got[1..], PUBLIC_FALLBACK_DNS);
+        assert_eq!(got[1..], PUBLIC_FALLBACK_DNS[..3]);
     }
 
     #[test]
     fn control_plane_honors_the_operator() {
-        let lan: Ipv4Addr = "192.168.1.1".parse().unwrap();
-        let custom: Ipv4Addr = "9.9.9.9".parse().unwrap();
+        let lan: IpAddr = "192.168.1.1".parse().unwrap();
+        let custom: IpAddr = "9.9.9.9".parse().unwrap();
 
         // Augment: the operator's server first, then the host's, then public.
         let aug = ServerOverride {
@@ -791,7 +848,7 @@ mod tests {
 
     #[test]
     fn control_plane_dedupes_and_caps() {
-        let lan: Ipv4Addr = "192.168.1.1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.1".parse().unwrap();
         // A host that already lists a public resolver must not get it twice.
         let got = control_plane_nameservers(
             &ServerOverride::default(),
@@ -799,14 +856,195 @@ mod tests {
         );
         assert_eq!(
             got,
-            vec![lan, PUBLIC_FALLBACK_DNS[0], PUBLIC_FALLBACK_DNS[1]]
+            vec![
+                lan,
+                PUBLIC_FALLBACK_DNS[0],
+                PUBLIC_FALLBACK_DNS[1],
+                PUBLIC_FALLBACK_DNS[2]
+            ]
         );
 
         // A long resolv.conf is truncated rather than fanned out over.
-        let many: Vec<Ipv4Addr> = (1..=8).map(|i| Ipv4Addr::new(192, 168, 1, i)).collect();
+        let many: Vec<IpAddr> = (1..=8)
+            .map(|i| Ipv4Addr::new(192, 0, 2, i).into())
+            .collect();
         let got = control_plane_nameservers(&ServerOverride::default(), Some(many.clone()));
         assert_eq!(got.len(), MAX_CONTROL_PLANE_NAMESERVERS);
-        assert_eq!(got, many[..MAX_CONTROL_PLANE_NAMESERVERS]);
+        assert_eq!(&got[..3], &many[..3]);
+        assert!(got[3].is_ipv6());
+        let configured = ServerOverride {
+            servers: many.iter().map(ToString::to_string).collect(),
+            replace: true,
+        };
+        assert_eq!(
+            control_plane_nameservers(&configured, None),
+            many[..MAX_CONTROL_PLANE_NAMESERVERS]
+        );
+    }
+
+    #[test]
+    fn control_plane_keeps_configured_ipv6_resolvers() {
+        let v6: IpAddr = "2001:db8::53".parse().unwrap();
+        for replace in [false, true] {
+            let configured = ServerOverride {
+                servers: vec![v6.to_string()],
+                replace,
+            };
+            let got = control_plane_nameservers(&configured, Some(vec![]));
+            assert_eq!(got.first(), Some(&v6));
+            if replace {
+                assert_eq!(got, vec![v6]);
+            }
+        }
+    }
+
+    #[test]
+    fn control_plane_has_ipv6_fallback_with_ipv4_system_resolvers() {
+        for count in [0, 2, 8] {
+            let system = (1..=count)
+                .map(|i| Ipv4Addr::new(192, 0, 2, i).into())
+                .collect();
+            let got = control_plane_nameservers(&ServerOverride::default(), Some(system));
+            assert!(got.iter().any(IpAddr::is_ipv6));
+            assert!(got.len() <= MAX_CONTROL_PLANE_NAMESERVERS);
+        }
+    }
+
+    #[test]
+    fn control_plane_keeps_system_ipv6_resolvers_and_both_families_when_capped() {
+        let v6: IpAddr = "2001:db8::53".parse().unwrap();
+        let got = control_plane_nameservers(&ServerOverride::default(), Some(vec![v6]));
+        assert_eq!(got[0], v6);
+
+        let mut system: Vec<IpAddr> = (1..=8)
+            .map(|i| Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i).into())
+            .collect();
+        let v4: IpAddr = "192.0.2.53".parse().unwrap();
+        system.push(v4);
+        let got = control_plane_nameservers(&ServerOverride::default(), Some(system.clone()));
+        assert_eq!(&got[..3], &system[..3]);
+        assert_eq!(got[3], v4);
+    }
+
+    #[tokio::test]
+    async fn endpoint_starts_and_accepts_direct_connections_without_dns() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let key = SecretKey::generate();
+        let lookup = MemoryLookup::new();
+        let alpns = mesh_alpns();
+        let offline = ServerOverride {
+            servers: vec!["https://relay.invalid".into()],
+            replace: true,
+        };
+        let discovery = ServerOverride {
+            servers: vec!["https://discovery.invalid".into()],
+            replace: true,
+        };
+        let bind = BindConfig {
+            secret_key: &key,
+            alpns: &alpns,
+            tor: false,
+            relay: &offline,
+            discovery: &discovery,
+            nameservers: &[],
+            dns_replace: true,
+            warm_lookup: &lookup,
+            quic_engine: QuicEngine::default(),
+        };
+        timeout(Duration::from_secs(5), async {
+            let endpoint = bind_endpoint(&bind, 0).await.unwrap();
+            let resolver = endpoint.dns_resolver().unwrap();
+            assert!(
+                resolver
+                    .lookup_ipv4("relay.invalid", Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+
+            let peer = Endpoint::builder(presets::N0)
+                .alpns(alpns.clone())
+                .relay_mode(RelayMode::Disabled)
+                .bind()
+                .await
+                .unwrap();
+            lookup.add_endpoint_info(peer.addr());
+            let accept = async {
+                let incoming = peer.accept().await.unwrap();
+                incoming.await.unwrap()
+            };
+            let alpn = mesh_alpn();
+            let (connected, accepted) = tokio::join!(
+                connect_to_peer_with_alpn(&endpoint, peer.id(), &alpn),
+                accept,
+            );
+            assert_eq!(connected.unwrap().remote_id(), peer.id());
+            assert_eq!(accepted.remote_id(), endpoint.id());
+            endpoint.close().await;
+            peer.close().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A direct hint that now reaches a different endpoint fails the dial
+    /// outright, and the error must be recognised as that case so the hint is
+    /// dropped. Afterwards only the relay hint is left for the peer.
+    #[tokio::test]
+    async fn a_hint_reaching_another_endpoint_is_recognised_and_forgotten() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let warm = MemoryLookup::new();
+        let bind = |lookup: Option<MemoryLookup>| async move {
+            let mut builder = Endpoint::builder(presets::N0)
+                .alpns(mesh_alpns())
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup();
+            if let Some(lookup) = lookup {
+                builder = builder.address_lookup(lookup);
+            }
+            builder.bind().await.unwrap()
+        };
+        let dialer = bind(Some(warm.clone())).await;
+        let peer = bind(None).await;
+        let impostor = bind(None).await;
+        let accept = impostor.clone();
+        let acceptor = tokio::spawn(async move {
+            while let Some(incoming) = accept.accept().await {
+                let _ = incoming.await;
+            }
+        });
+        let stale = impostor
+            .addr()
+            .addrs
+            .into_iter()
+            .filter(TransportAddr::is_ip);
+        warm.add_endpoint_info(EndpointAddr::from_parts(peer.id(), stale));
+
+        let alpn = mesh_alpn();
+        let err = timeout(
+            Duration::from_secs(5),
+            connect_to_peer_with_alpn(&dialer, peer.id(), &alpn),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(is_wrong_peer(&err), "{err}");
+        assert!(!is_alpn_mismatch(&err), "{err}");
+
+        let relay: RelayUrl = "https://relay.example".parse().unwrap();
+        warm.add_endpoint_info(EndpointAddr::new(peer.id()).with_relay_url(relay.clone()));
+        forget_direct_hints(&warm, peer.id());
+        let left = EndpointAddr::from(warm.get_endpoint_info(peer.id()).unwrap());
+        assert_eq!(left, EndpointAddr::new(peer.id()).with_relay_url(relay));
+
+        acceptor.abort();
+        dialer.close().await;
+        peer.close().await;
+        impostor.close().await;
     }
 
     #[test]
