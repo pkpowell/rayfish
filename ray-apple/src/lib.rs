@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 use rayfish::config;
-use rayfish::config::QuicEngine;
 use rayfish::config::settings::GlobalKey;
+use rayfish::config::{DnsMode, QuicEngine};
 #[cfg(target_os = "macos")]
 use rayfish::daemon::start_embedded_ipc;
 use rayfish::daemon::{DaemonState, build_headless};
@@ -67,6 +67,7 @@ pub struct NodeStatus {
     pub files: Vec<IncomingFile>,
     pub ssh: NodeSshStatus,
     pub services: NodeServiceStatus,
+    pub exit_nodes: Vec<ExitNodeNetwork>,
     pub connection_warning: Option<String>,
     pub file_auto_accept_peers: Vec<String>,
     pub inbound: NodeInboundStatus,
@@ -164,6 +165,15 @@ pub struct NodeServiceStatus {
     pub mdns_active: bool,
     pub v4_bridge_enabled: bool,
     pub quic_fq_codel: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct ExitNodeNetwork {
+    pub network: String,
+    pub using: Option<String>,
+    pub available: Vec<String>,
+    pub refused: Vec<String>,
+    pub problem: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -418,6 +428,22 @@ impl Node {
             })
             .collect();
         let settings = config::load().map_err(AppleError::network)?;
+        let exit_nodes = match state.external_exit_node_status() {
+            IpcMessage::ExitNodeState { networks } => networks
+                .into_iter()
+                .map(|network| ExitNodeNetwork {
+                    network: network.network,
+                    using: network.using,
+                    available: network.available,
+                    refused: network.refused,
+                    problem: network.not_in_effect,
+                })
+                .collect(),
+            response => {
+                expect_ok(response, "exit-node status")?;
+                Vec::new()
+            }
+        };
         let connection_requests = match state.list_connections() {
             IpcMessage::PendingRequests { requests } => requests
                 .into_iter()
@@ -534,6 +560,7 @@ impl Node {
             files,
             ssh,
             services,
+            exit_nodes,
             connection_warning,
             file_auto_accept_peers: settings
                 .file_auto_accept_peers
@@ -542,6 +569,54 @@ impl Node {
                 .collect(),
             inbound,
         })
+    }
+
+    pub fn prepare_exit_node(&self) -> Result<(), AppleError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state()?;
+            self.runtime
+                .block_on(state.prepare_external_exit_node())
+                .map_err(AppleError::network)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppleError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn prepare_exit_transport(&self) -> Result<(), AppleError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state()?;
+            self.runtime
+                .block_on(state.prepare_external_exit_transport());
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppleError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn select_exit_node(
+        &self,
+        network: String,
+        peer: Option<String>,
+    ) -> Result<(), AppleError> {
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.state()?;
+            let response = self
+                .runtime
+                .block_on(state.select_external_exit_node(&network, peer));
+            expect_ok(response, "exit-node selection")
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (network, peer);
+            Err(AppleError::UnsupportedPlatform)
+        }
     }
 
     /// Probe enrolled machines separately so an offline machine cannot delay status.
@@ -587,12 +662,7 @@ impl Node {
                 .block_on(state.set_mdns_enabled(enabled))
                 .map_err(AppleError::network);
         }
-        let value = match (key, enabled) {
-            (GlobalSetting::QuicFqCodel, true) => QuicEngine::FqCodel.as_ref(),
-            (GlobalSetting::QuicFqCodel, false) => QuicEngine::Standalone.as_ref(),
-            (_, true) => "on",
-            (_, false) => "off",
-        };
+        let value = toggle_value(key, enabled);
         config::update_settings(|settings| config::config_set(settings, key.into(), value, false))
             .map(|_| ())
             .map_err(AppleError::network)
@@ -970,6 +1040,11 @@ impl Node {
         }
         #[cfg(target_os = "macos")]
         {
+            rayfish::exit_node::set_full_tunnel(false);
+            rayfish::exit_node::clear_physical_defaults();
+        }
+        #[cfg(target_os = "macos")]
+        {
             *active = false;
         }
         #[cfg(target_os = "macos")]
@@ -1087,11 +1162,30 @@ fn expect_ok(response: IpcMessage, operation: &str) -> Result<(), AppleError> {
     }
 }
 
+/// The `ray config` value a toggle writes for `key`.
+fn toggle_value(key: GlobalSetting, enabled: bool) -> &'static str {
+    match (key, enabled) {
+        (GlobalSetting::QuicFqCodel, true) => QuicEngine::FqCodel.as_ref(),
+        (GlobalSetting::QuicFqCodel, false) => QuicEngine::Standalone.as_ref(),
+        // Enabling restores the default mode, not `on`, which would also turn
+        // on short names the user never asked for.
+        (GlobalSetting::Dns, true) => DnsMode::default().into(),
+        (_, true) => "on",
+        (_, false) => "off",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn dns_toggle_turns_on_the_default_mode() {
+        assert_eq!(toggle_value(GlobalSetting::Dns, true), "partial");
+        assert_eq!(toggle_value(GlobalSetting::Dns, false), "off");
+    }
 
     #[test]
     fn unreadable_invitations_leave_the_status_usable() {

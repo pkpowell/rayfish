@@ -247,7 +247,7 @@ pub fn restore_host_state() {
     crate::dns::config::emergency_restore_resolv_conf();
     crate::dns::config::emergency_withdraw_resolvconf();
     crate::exit_node::disable();
-    crate::exit_node::teardown_client_routing();
+    crate::exit_node::teardown_client_routing(None);
 }
 
 /// Legacy name for [`Daemon`], kept so embedders (`ray-mobile`) that were
@@ -477,7 +477,7 @@ async fn announce_handles_with(
         None,
         &ControlMsg::NetworkHandles {
             entries,
-            features: transport::FEATURE_IDLE_CLOSE,
+            features: transport::FEATURE_IDLE_CLOSE | transport::FEATURE_EXIT_IPV4,
             receive_mtu: peers.local_mtu(),
         },
     )
@@ -944,6 +944,11 @@ pub struct Daemon {
     /// Handles for the packet-forwarding tasks spawned by
     /// [`Daemon::attach_tun`], kept so a future `down()`/detach can stop them.
     tun_tasks: Mutex<Option<TunTasks>>,
+    /// NetworkExtension owns routes and DNS for an externally attached macOS TUN.
+    #[cfg(target_os = "macos")]
+    external_exit_tun: AtomicBool,
+    #[cfg(target_os = "macos")]
+    external_exit_staging: AtomicBool,
     /// Set when the data plane fails in a way only a restart repairs.
     pub(crate) fatal: Arc<FatalExit>,
     /// Serializes exit-node reconciles. `apply_exit_node` runs from the IPC
@@ -979,6 +984,9 @@ pub struct Daemon {
     /// Whether the VPN is currently active (TUN up, networks connected) or on
     /// standby. Toggled by the `Up`/`Down` IPC commands.
     active: Arc<AtomicBool>,
+    /// Windows Up/Down must not race route setup against standby cleanup.
+    #[cfg(windows)]
+    data_plane_lifecycle: AsyncMutex<()>,
     /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
     /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
     /// changes without restart. See [`crate::ssh`]. Desktop-only: the embedded
@@ -1203,11 +1211,13 @@ impl Daemon {
             // idle-closes.
             let dialer = Some(Arc::clone(&self.registry));
             let local_ipv6 = self.transport.identity.local_ipv6();
+            let active = Arc::clone(&self.active);
             let fatal = Arc::clone(&self.fatal);
             let shutdown = self.shutdown_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = (forward::MeshForwarder {
                     tun: reader,
+                    active,
                     local_ipv6,
                     peers,
                     firewall,
@@ -2351,6 +2361,8 @@ pub(crate) mod accept_handler_tests {
         identity: IrohIdentityProvider,
         blob_store: FsStore,
     ) -> Arc<NetworkRegistry> {
+        use crate::endpoint_hints::WarmLookup;
+
         let transport = Arc::new(Transport::new(
             endpoint,
             identity,
@@ -2358,7 +2370,7 @@ pub(crate) mod accept_handler_tests {
             Arc::new(ForwardMetrics::default()),
             TransportBootstrap {
                 lan_peers: Arc::new(LanPeers::new()),
-                warm_lookup: iroh::address_lookup::memory::MemoryLookup::new(),
+                warm_lookup: WarmLookup::default(),
                 pkarr_relay_url: dht::pkarr_relay_url(&config::ServerOverride::default()),
             },
         ));

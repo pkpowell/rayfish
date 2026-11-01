@@ -454,11 +454,31 @@ impl DnsService {
             return;
         }
         let mode = config::load().map(|c| c.dns_mode).unwrap_or_default();
+        self.set_search_domains_for_mode(network_names, mode, tun_name)
+            .await;
+    }
+
+    /// [`Self::set_search_domains`] with the mode already read. `Off` stops
+    /// before the OS: an empty list is not a no-op there, since the Linux and
+    /// Windows set paths always route `.ray`.
+    async fn set_search_domains_for_mode(
+        &self,
+        network_names: &[String],
+        mode: config::DnsMode,
+        tun_name: &str,
+    ) {
         let domains = search_domains_for_mode(network_names, mode);
         *self.search_domains.lock().unwrap() = domains.clone();
+        if !mode.enabled() {
+            return;
+        }
         let configurator = self.configurator.lock().unwrap().clone();
         let result = match configurator.as_ref() {
             Some(c) => c.set_search_domains(&domains, tun_name).await,
+            // Windows routes `.ray` on every set, and with no backend held
+            // nothing serves it, so lookups would time out. `configure`
+            // installs the cached list when it adopts one.
+            None if cfg!(windows) => return,
             None => dns_config::set_manager_search_domains(&domains, tun_name).await,
         };
         match result {
@@ -520,26 +540,8 @@ impl DnsService {
         });
     }
 
-    /// Re-apply the current OS-DNS configuration in place (no re-detect, no
-    /// re-capture of upstreams), then put the search domains back.
-    ///
-    /// Called when the exit-node full-tunnel state flips, so the macOS
-    /// configurator rewrites its match domains: catch-all (route all DNS through
-    /// Magic DNS, forwarded upstream via the tunnel) while an exit is up,
-    /// `.ray`-only split DNS otherwise. Also how [`run_sc_reassert`] repairs a
-    /// deleted configuration. No-op if DNS was never configured.
-    ///
-    /// The second half is not optional. `apply` writes the whole key from
-    /// scratch and the only search domain it knows is `.ray` itself; the
-    /// per-network ones that make a bare `box` resolve arrive separately, via
-    /// `set_search_domains`, and a re-apply that did not reinstall them would
-    /// drop every one until the next join or leave.
-    ///
-    /// macOS-only: it is the only platform whose exit-node client rewrites match
-    /// domains, so elsewhere this is dead code and `-D warnings` says so.
-    ///
-    /// [`run_sc_reassert`]: DnsService::run_sc_reassert
-    #[cfg(target_os = "macos")]
+    /// Reapply DNS routing domains after the exit selection changes.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) async fn reassert_os_config(&self, tun_name: &str) {
         // Clone the Arc out, not the guard, so the lock isn't held across await.
         let configurator = self.configurator.lock().unwrap().clone();
@@ -556,15 +558,6 @@ impl DnsService {
         {
             tracing::warn!(error = %e, "failed to reinstall search domains after re-applying system DNS");
         }
-    }
-
-    /// The active OS-DNS backend's name, or `None` before `configure` / after
-    /// `revert`. Used to say whether a change that only affects the daemon's own
-    /// forwarder can actually reach an application's queries: on a split-DNS
-    /// backend only `.ray` is routed to us, so everything else bypasses it.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn backend_name(&self) -> Option<&'static str> {
-        self.configurator.lock().unwrap().as_ref().map(|c| c.name())
     }
 
     /// Revert the OS-DNS changes made by [`configure`](Self::configure): stop the
@@ -680,6 +673,53 @@ mod tests {
         dns.shutdown_background();
         assert!(token.is_cancelled());
         assert!(dns.configure_retry.lock().unwrap().is_none());
+    }
+
+    /// With DNS off, a join or leave must not reach the OS. The Linux and
+    /// Windows set paths route `.ray` even for an empty list, so passing one
+    /// through would undo `off`.
+    #[tokio::test]
+    async fn off_mode_leaves_the_os_search_domains_alone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Recorder {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl dns_config::DnsConfigurator for Recorder {
+            async fn apply(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn revert(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "test"
+            }
+            async fn set_search_domains(
+                &self,
+                _domains: &[dns_config::SearchDomain],
+                _tun_name: &str,
+            ) -> anyhow::Result<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let dns = service();
+        let recorder = Arc::new(Recorder::default());
+        *dns.configurator.lock().unwrap() =
+            Some(Arc::clone(&recorder) as Arc<dyn dns_config::DnsConfigurator>);
+        let networks = vec!["example-net".to_string()];
+
+        dns.set_search_domains_for_mode(&networks, config::DnsMode::Off, "tun0")
+            .await;
+        assert_eq!(recorder.calls.load(Ordering::Relaxed), 0);
+
+        dns.set_search_domains_for_mode(&networks, config::DnsMode::Partial, "tun0")
+            .await;
+        assert_eq!(recorder.calls.load(Ordering::Relaxed), 1);
     }
 
     /// Declining is only safe with somebody to decline *to*. Both halves of
