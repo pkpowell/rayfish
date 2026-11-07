@@ -58,8 +58,9 @@ C="$(server_ip "$SERVERS" srv-c || true)"
 NET=exit
 MARK=0x7261      # exit_node::SOCKET_MARK
 TABLE=29793      # exit_node::EXIT_TABLE
-CLIENT_ADDR=192.0.0.2       # exit_node::ipv4::CLIENT_ADDR
-POOL=198.19.0.0/16          # exit_node::ipv4::SERVER_PREFIX
+CLIENT_ADDR=10.64.0.2       # exit_node::ipv4::LOCAL_CLIENT_ADDR (on the TUN)
+WIRE_ADDR=192.0.0.2         # exit_node::ipv4::WIRE_CLIENT_ADDR (on the mesh only)
+POOL=10.65.0.0/16           # exit_node::ipv4::SERVER_PREFIX
 FLOW_PORT=9099              # the pre-existing outbound flow in step 4
 
 # pub4 <host> [curl args...] : the host's public IPv4 as an external service sees
@@ -156,7 +157,7 @@ for f in -4 -6; do
   ip \$f route flush table $TABLE
 done
 dev=\$(ip -o link show | awk -F': ' '\$2 ~ /^rayfish/ {print \$2; exit}' | cut -d@ -f1)
-[ -n \"\$dev\" ] && { ip -4 addr del $CLIENT_ADDR/32 dev \$dev; ip -4 route del $POOL dev \$dev; }
+[ -n \"\$dev\" ] && { ip -4 addr del $CLIENT_ADDR/32 dev \$dev; ip -4 addr del $WIRE_ADDR/32 dev \$dev; ip -4 route del $POOL dev \$dev; }
 $FIXTURE_CLEANUP
 sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
 rm -f /tmp/exit-disarm" >/dev/null 2>&1
@@ -395,9 +396,17 @@ retry_until 10 "on '$A' \"ss -ltn 'sport = :$FLOW_PORT'\" 2>/dev/null | grep -q 
   || fail "the echo server on srv-a never listened on port $FLOW_PORT"
 on "$B" "setsid nohup python3 /tmp/exit-flow.py >/tmp/exit-flow.log 2>&1 < /dev/null &" >/dev/null 2>&1
 flow_count(){ on "$B" "grep -c '^ok' /tmp/exit-flow.log" 2>/dev/null; }
-retry_until 15 "[[ \"\$(flow_count)\" -ge 2 ]]" \
-  && pass "baseline: srv-b's long-lived TCP flow to srv-a is running" \
-  || fail "baseline: the long-lived TCP flow to srv-a never started"
+# A Boat VM's IPv4 is NAT with no inbound port mapping, so nothing can connect
+# to srv-a over it; the flow checks need a host that takes inbound IPv4.
+FLOW=1
+if retry_until 15 "[[ \"\$(flow_count)\" -ge 2 ]]"; then
+  pass "baseline: srv-b's long-lived TCP flow to srv-a is running"
+elif [[ "$E2E_BACKEND" == boat ]]; then
+  FLOW=0
+  skip "the long-lived TCP flow: srv-a's public IPv4 takes no inbound connections on Boat"
+else
+  fail "baseline: the long-lived TCP flow to srv-a never started"
+fi
 
 # The LAN, read before the selection: srv-a's VPC address.
 A_PRIV="$(private4 "$A")"
@@ -489,6 +498,9 @@ done
 on "$B" "ip -4 addr show dev ${B_TUN:-rayfish}" 2>/dev/null | grep -q "inet $CLIENT_ADDR/32" \
   && pass "srv-b holds the IPv4 client address $CLIENT_ADDR on its TUN" \
   || fail "srv-b has no $CLIENT_ADDR on its TUN: IPv4 has no source"
+on "$B" "ip -4 addr show" 2>/dev/null | grep -q "inet $WIRE_ADDR/" \
+  && fail "srv-b put the wire address $WIRE_ADDR on a host interface" \
+  || pass "the wire address $WIRE_ADDR stays off srv-b's interfaces"
 
 # The client guard: new flows leaving outside the tunnel are refused, and nothing
 # else. A drop-all policy would cut the LAN, Docker and other VPNs.
@@ -510,7 +522,9 @@ grep -q "policy drop" <<<"$B_CLIENT_NFT" \
 flow_before="$(flow_count)"
 sleep 4
 flow_after="$(flow_count)"
-if on "$B" "grep -q '^ERR' /tmp/exit-flow.log" 2>/dev/null; then
+if [[ "$FLOW" == 0 ]]; then
+  :
+elif on "$B" "grep -q '^ERR' /tmp/exit-flow.log" 2>/dev/null; then
   fail "the TCP flow opened before the selection broke: $(on "$B" "grep '^ERR' /tmp/exit-flow.log | head -1")"
 elif [[ "${flow_after:-0}" -gt "${flow_before:-0}" ]]; then
   pass "the TCP flow opened before the selection is still answered ($flow_before -> $flow_after)"

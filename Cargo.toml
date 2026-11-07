@@ -1,6 +1,6 @@
 [package]
 name = "rayfish"
-version = "0.5.13"
+version = "0.5.16"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Dario <dario@rayfish.xyz>"]
@@ -131,7 +131,6 @@ serde = { version = "1", features = ["derive"] }
 strum = { version = "0.28", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.13"
-nom = "8"
 toml = "1.1"
 # Format-agnostic config loading for `ray apply` specs (YAML/TOML/JSON by
 # extension). Read-only; `--dry-run`/`--example` output uses serde_yml.

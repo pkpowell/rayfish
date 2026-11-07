@@ -721,12 +721,7 @@ pub(crate) fn system_nameservers() -> Option<Vec<IpAddr>> {
         &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
     ));
     #[cfg(target_os = "macos")]
-    let found = Some(
-        macos::capture_system_upstreams()
-            .into_iter()
-            .map(IpAddr::V4)
-            .collect::<Vec<_>>(),
-    );
+    let found = Some(macos::capture_system_upstreams());
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let found: Option<Vec<IpAddr>> = None;
 
@@ -1645,7 +1640,7 @@ pub(super) fn merge_search_domains(
     }
     let root = SearchDomain::root();
     let mut dropped = out.split_off(MAX_SEARCH_DOMAINS);
-    if !out.contains(&root) {
+    if rayfish.contains(&root) && !out.contains(&root) {
         dropped.retain(|d| *d != root);
         dropped.push(out.pop().expect("cap is non-zero"));
         out.push(root);

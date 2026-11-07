@@ -4,9 +4,11 @@
 //! counters via `Family<DropLabels, Counter>`. A background logger prints
 //! 30-second interval deltas and a session summary on shutdown.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use iroh::endpoint::PathStats;
 use iroh_metrics::{Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -54,7 +56,8 @@ pub enum DropReason {
     QueueFull,
     /// The TUN device delivered a packet its reader could not decode, such as a
     /// Linux offload record needing more segments than tun-rs can split it
-    /// into. Only that packet is lost; the forwarding loop keeps reading.
+    /// into. Counts failed records, each potentially containing multiple IP
+    /// packets; the forwarding loop keeps reading.
     TunRead,
 }
 
@@ -95,8 +98,9 @@ pub struct MetricsSnapshot {
     pub tun_write_packets: u64,
     pub tun_write_errors: u64,
     pub tun_write_batch_limit: i64,
-    pub tun_tcp_gso_enabled: bool,
-    pub tun_udp_gso_enabled: bool,
+    pub tun_tcp_offload_enabled: bool,
+    pub tun_udp_offload_enabled: bool,
+    pub mesh_quic_segmentation_offload_enabled: bool,
     /// `(reason, count)` for each drop reason, in `DropReason::ALL` order.
     pub drops: Vec<(String, u64)>,
     pub uptime_secs: u64,
@@ -118,9 +122,12 @@ pub struct ForwardMetrics {
     /// Maximum packets supported by one TUN write on this platform.
     pub tun_write_batch_limit: Gauge,
     /// Whether the TUN interface accepted TCP segmentation/receive offload.
-    pub tun_tcp_gso_enabled: Gauge,
+    pub tun_tcp_offload_enabled: Gauge,
     /// Whether the TUN interface accepted UDP segmentation/receive offload.
-    pub tun_udp_gso_enabled: Gauge,
+    pub tun_udp_offload_enabled: Gauge,
+    /// Whether mesh QUIC connections may submit segmented transmits. Disabled
+    /// means one UDP datagram per transmit. Excludes iroh address discovery.
+    pub mesh_quic_segmentation_offload_enabled: Gauge,
     /// Total bytes received from peers
     pub bytes_rx: Counter,
     /// Total bytes sent to peers
@@ -205,8 +212,12 @@ impl ForwardMetrics {
             tun_write_packets: self.tun_write_packets.get(),
             tun_write_errors: self.tun_write_errors.get(),
             tun_write_batch_limit: self.tun_write_batch_limit.get(),
-            tun_tcp_gso_enabled: self.tun_tcp_gso_enabled.get() != 0,
-            tun_udp_gso_enabled: self.tun_udp_gso_enabled.get() != 0,
+            tun_tcp_offload_enabled: self.tun_tcp_offload_enabled.get() != 0,
+            tun_udp_offload_enabled: self.tun_udp_offload_enabled.get() != 0,
+            mesh_quic_segmentation_offload_enabled: self
+                .mesh_quic_segmentation_offload_enabled
+                .get()
+                != 0,
             drops,
             uptime_secs: start.elapsed().as_secs(),
         }
@@ -289,6 +300,9 @@ pub struct PeerMetrics {
     pub congestion_window_bytes: Family<PeerLabels, Gauge>,
     /// Congestion events on the selected path
     pub congestion_events: Family<PeerLabels, Gauge>,
+    /// Spurious congestion events on the selected path: packets declared lost
+    /// were later acknowledged. Counts events, not packets; resets on path changes.
+    pub spurious_congestion_events: Family<PeerLabels, Gauge>,
     /// Current UDP payload MTU on the selected path
     pub path_mtu_bytes: Family<PeerLabels, Gauge>,
     /// Whether the selected path uses a relay instead of direct UDP
@@ -301,9 +315,13 @@ impl PeerMetrics {
     pub fn spawn_collector(self: &Arc<Self>, peers: PeerTable, token: CancellationToken) {
         let metrics = Arc::clone(self);
         tokio::spawn(async move {
+            // Labels exported last tick, so a peer that has left the table
+            // stops exporting instead of freezing at its last values forever.
+            let mut exported = HashSet::new();
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        let mut live = HashSet::new();
                         for (ip, conn) in peers.all_connections() {
                             let label = PeerLabels {
                                 peer: ip.to_string(),
@@ -311,12 +329,7 @@ impl PeerMetrics {
 
                             let paths = conn.paths();
                             if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-                                let stats = path.stats();
-                                metrics.rtt_us.get_or_create(&label).set(stats.rtt.as_micros() as i64);
-                                metrics.congestion_window_bytes.get_or_create(&label).set(stats.cwnd as i64);
-                                metrics.congestion_events.get_or_create(&label).set(stats.congestion_events as i64);
-                                metrics.path_mtu_bytes.get_or_create(&label).set(i64::from(stats.current_mtu));
-                                metrics.path_is_relay.get_or_create(&label).set(i64::from(path.is_relay()));
+                                metrics.record_path_stats(&label, &path.stats(), path.is_relay());
                             }
 
                             let stats = conn.stats();
@@ -326,18 +339,132 @@ impl PeerMetrics {
                             metrics.lost_bytes.get_or_create(&label).set(stats.lost_bytes as i64);
                             let queued = peers.queued_bytes(&conn);
                             metrics.datagram_send_queue_bytes.get_or_create(&label).set(queued as i64);
+                            live.insert(label);
                         }
+                        metrics.prune(&exported, &live);
+                        exported = live;
                     }
                     _ = token.cancelled() => return,
                 }
             }
         });
     }
+
+    fn record_path_stats(&self, label: &PeerLabels, stats: &PathStats, is_relay: bool) {
+        self.rtt_us
+            .get_or_create(label)
+            .set(stats.rtt.as_micros() as i64);
+        self.congestion_window_bytes
+            .get_or_create(label)
+            .set(stats.cwnd as i64);
+        self.congestion_events
+            .get_or_create(label)
+            .set(stats.congestion_events as i64);
+        self.spurious_congestion_events
+            .get_or_create(label)
+            .set(i64::try_from(stats.spurious_congestion_events).unwrap_or(i64::MAX));
+        self.path_mtu_bytes
+            .get_or_create(label)
+            .set(i64::from(stats.current_mtu));
+        self.path_is_relay
+            .get_or_create(label)
+            .set(i64::from(is_relay));
+    }
+
+    /// Drop every series for a peer in `exported` that is not in `live`.
+    fn prune(&self, exported: &HashSet<PeerLabels>, live: &HashSet<PeerLabels>) {
+        for label in exported.difference(live) {
+            self.forget(label);
+        }
+    }
+
+    fn forget(&self, label: &PeerLabels) {
+        let families = [
+            &self.rtt_us,
+            &self.bytes_tx,
+            &self.bytes_rx,
+            &self.lost_packets,
+            &self.lost_bytes,
+            &self.congestion_window_bytes,
+            &self.congestion_events,
+            &self.spurious_congestion_events,
+            &self.path_mtu_bytes,
+            &self.path_is_relay,
+            &self.datagram_send_queue_bytes,
+        ];
+        for family in families {
+            family.remove(label);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use iroh_metrics::Registry;
+
     use super::*;
+
+    #[test]
+    fn selected_path_exports_spurious_congestion_events() {
+        let metrics = Arc::new(PeerMetrics::default());
+        let label = PeerLabels {
+            peer: "200::1".to_string(),
+        };
+        let mut path = PathStats::default();
+        path.congestion_events = 11;
+        path.spurious_congestion_events = 3;
+        metrics.record_path_stats(&label, &path, false);
+
+        let mut registry = Registry::default();
+        registry.register(metrics.clone());
+        let mut output = String::new();
+        registry.encode_openmetrics_to_writer(&mut output).unwrap();
+        assert!(output.contains("rayfish_peer_spurious_congestion_events{peer=\"200::1\"} 3\n"));
+        assert!(output.contains("rayfish_peer_congestion_events{peer=\"200::1\"} 11\n"));
+
+        // A newly selected path has its own event count.
+        path.spurious_congestion_events = 0;
+        metrics.record_path_stats(&label, &path, false);
+        output.clear();
+        registry.encode_openmetrics_to_writer(&mut output).unwrap();
+        assert!(output.contains("rayfish_peer_spurious_congestion_events{peer=\"200::1\"} 0\n"));
+
+        metrics.prune(&HashSet::from([label]), &HashSet::new());
+        output.clear();
+        registry.encode_openmetrics_to_writer(&mut output).unwrap();
+        assert!(
+            !output
+                .lines()
+                .any(|line| { line.starts_with("rayfish_peer_spurious_congestion_events{") })
+        );
+    }
+
+    #[test]
+    fn a_departed_peer_stops_exporting() {
+        let metrics = PeerMetrics::default();
+        let stays = PeerLabels {
+            peer: "200::1".to_string(),
+        };
+        let leaves = PeerLabels {
+            peer: "200::2".to_string(),
+        };
+        for label in [&stays, &leaves] {
+            metrics.rtt_us.get_or_create(label).set(10);
+            metrics.bytes_tx.get_or_create(label).set(10);
+            metrics
+                .datagram_send_queue_bytes
+                .get_or_create(label)
+                .set(10);
+        }
+
+        let exported = HashSet::from([stays.clone(), leaves.clone()]);
+        metrics.prune(&exported, &HashSet::from([stays.clone()]));
+
+        assert!(metrics.rtt_us.get(&stays).is_some());
+        assert!(metrics.rtt_us.get(&leaves).is_none());
+        assert!(metrics.bytes_tx.get(&leaves).is_none());
+        assert!(metrics.datagram_send_queue_bytes.get(&leaves).is_none());
+    }
 
     #[test]
     fn test_record_rx() {
@@ -405,6 +532,28 @@ mod tests {
             .find(|(r, _)| r == "NoPeer")
             .map(|(_, c)| *c);
         assert_eq!(no_peer, Some(1));
+    }
+
+    #[test]
+    fn offload_diagnostics_distinguish_tun_from_quic() {
+        let stats = Arc::new(ForwardMetrics::default());
+        stats.tun_tcp_offload_enabled.set(1);
+        stats.tun_udp_offload_enabled.set(1);
+        stats.mesh_quic_segmentation_offload_enabled.set(0);
+        let snapshot = serde_json::to_value(stats.snapshot(Instant::now())).unwrap();
+        assert_eq!(snapshot["tun_tcp_offload_enabled"], true);
+        assert_eq!(snapshot["tun_udp_offload_enabled"], true);
+        assert_eq!(snapshot["mesh_quic_segmentation_offload_enabled"], false);
+
+        let mut registry = Registry::default();
+        registry.register(stats);
+        let mut output = String::new();
+        registry.encode_openmetrics_to_writer(&mut output).unwrap();
+        assert!(output.contains("rayfish_tun_tcp_offload_enabled 1\n"));
+        assert!(output.contains("rayfish_tun_udp_offload_enabled 1\n"));
+        assert!(output.contains("rayfish_mesh_quic_segmentation_offload_enabled 0\n"));
+        assert!(!output.contains("tun_tcp_gso_enabled"));
+        assert!(!output.contains("tun_udp_gso_enabled"));
     }
 
     /// `ALL` is hand-maintained and is the only thing `total_drops` and the

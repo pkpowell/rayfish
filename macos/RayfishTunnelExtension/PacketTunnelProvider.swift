@@ -182,13 +182,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         settings.ipv6Settings = ipv6
         if exitSelected {
-            let ipv4 = NEIPv4Settings(addresses: ["192.0.0.2"], subnetMasks: ["255.255.255.255"])
+            // ipv4::LOCAL_CLIENT_ADDR. The Rust core swaps it for the wire address.
+            let ipv4 = NEIPv4Settings(addresses: ["10.64.0.2"], subnetMasks: ["255.255.255.255"])
             ipv4.includedRoutes = [NEIPv4Route(destinationAddress: "0.0.0.0", subnetMask: "0.0.0.0")]
             settings.ipv4Settings = ipv4
         }
         if dnsEnabled {
             let dns = NEDNSSettings(servers: ["200::53"])
             dns.matchDomains = exitSelected ? [""] : ["ray"]
+            dns.matchDomainsNoSearch = true
             settings.dnsSettings = dns
         }
         return settings
