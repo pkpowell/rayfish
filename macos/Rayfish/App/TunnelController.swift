@@ -25,8 +25,19 @@ final class TunnelController: ObservableObject {
 
     @Published var page: RayfishPage = .networks
 
+    private let fileHandoff = FileHandoff()
+    private var deliveredFiles: [FileHandoff.Delivered]
+    private var deliveryTask: Task<Void, Never>?
+    /// The last status from the extension, before `FileHandoff.present`.
+    private var providerStatus: ProviderStatus?
+
     @Published var status: ProviderStatus? {
-        didSet { notifications.update(status) }
+        didSet {
+            providerStatus = status
+            status = FileHandoff.present(status, delivered: deliveredFiles, incoming: fileHandoff.incoming)
+            notifications.update(status)
+            deliverReceivedFiles()
+        }
     }
     @Published private(set) var firewall: ProviderFirewallState?
     @Published private(set) var machines: [ProviderMachine] = []
@@ -59,7 +70,12 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    init() {
+        deliveredFiles = fileHandoff.savedDelivered()
+    }
+
     deinit {
+        deliveryTask?.cancel()
         pollingTask?.cancel()
         machinesTask?.cancel()
         reconnectTask?.cancel()
@@ -195,46 +211,33 @@ final class TunnelController: ObservableObject {
             let manager = try await TunnelPreferences.configured()
             RayfishLog.startup("tunnel preferences configured", since: started, logger: RayfishLog.app)
             guard !isQuitting else { return }
+            let monitor = TunnelConnectionMonitor(connection: manager.connection)
             if manager.connection.status != .connected && manager.connection.status != .connecting
                 && manager.connection.status != .reasserting {
                 try manager.connection.startVPNTunnel()
             }
             RayfishLog.startup("waiting for VPN connection", since: started, logger: RayfishLog.app)
-            var observedConnecting = false
             connectionStatus = .connecting
-            for _ in 0..<180 {
-                guard !isQuitting else { return }
-                let current = manager.connection.status
-                // startVPNTunnel returns before macOS publishes the new state.
-                // Until then, disconnected and its last error describe the old session.
-                if current == .disconnected && !observedConnecting {
-                    try await Task.sleep(nanoseconds: 500_000_000)
-                    continue
-                }
-                connectionStatus = current
-                observedConnecting = observedConnecting || current == .connecting || current == .reasserting
-                if isConnected {
-                    RayfishLog.startup("VPN connected", since: started, logger: RayfishLog.app)
-                    let response = try await TunnelIPC.request(ProviderRequest(action: .status))
-                    RayfishLog.startup("initial status received", since: started, logger: RayfishLog.app)
-                    status = response.status
-                    if status?.needsTCPHelper == true {
-                        try SSHHelper.register(openSettings: true)
-                        error = SSHHelper.approvalMessage
-                    }
-                    refreshMachines()
-                    UserDefaults.standard.set(true, forKey: Self.migrationCompletedKey)
-                    RayfishLog.startup("connection ready", since: started, logger: RayfishLog.app)
-                    return
-                }
-                if connectionStatus == .disconnected || connectionStatus == .invalid {
-                    try await manager.connection.fetchLastDisconnectError()
-                    throw TunnelIPCError.unavailable
-                }
-                try await Task.sleep(nanoseconds: 500_000_000)
+            do {
+                try await monitor.wait(onStatus: { self.connectionStatus = $0 })
+            } catch TunnelIPCError.unavailable {
+                try await manager.connection.fetchLastDisconnectError()
+                throw TunnelIPCError.unavailable
             }
-            throw TunnelIPCError.timedOut
+            guard !isQuitting else { return }
+            RayfishLog.startup("VPN connected", since: started, logger: RayfishLog.app)
+            let response = try await TunnelIPC.request(ProviderRequest(action: .status))
+            RayfishLog.startup("initial status received", since: started, logger: RayfishLog.app)
+            status = response.status
+            if status?.needsTCPHelper == true {
+                try SSHHelper.register(openSettings: true)
+                error = SSHHelper.approvalMessage
+            }
+            refreshMachines()
+            UserDefaults.standard.set(true, forKey: Self.migrationCompletedKey)
+            RayfishLog.startup("connection ready", since: started, logger: RayfishLog.app)
         } catch {
+            guard !isQuitting else { return }
             RayfishLog.startup("connection attempt failed", since: started, logger: RayfishLog.app)
             self.error = error.localizedDescription
             connectionStatus = (try? await TunnelPreferences.load())?.connection.status ?? .disconnected
@@ -297,12 +300,12 @@ final class TunnelController: ObservableObject {
         throw TunnelIPCError.timedOut
     }
 
-    func create(name: String?, hostname: String?) async {
-        _ = await perform(ProviderRequest(action: .create, name: name, hostname: hostname))
+    func create(name: String?, hostname: String?) async -> Bool {
+        await perform(ProviderRequest(action: .create, name: name, hostname: hostname)) != nil
     }
 
-    func join(code: String, hostname: String?) async {
-        _ = await perform(ProviderRequest(action: .join, code: code, hostname: hostname))
+    func join(code: String, hostname: String?) async -> Bool {
+        await perform(ProviderRequest(action: .join, code: code, hostname: hostname)) != nil
     }
 
     func invite(network: String) async -> String? {
@@ -437,18 +440,39 @@ final class TunnelController: ObservableObject {
         _ = await perform(ProviderRequest(action: .unblockPeer, peer: peer))
     }
 
-    func acceptFile(_ file: ProviderFile, directory: URL) async {
+    /// Accept `file` into `directory`. The extension cannot write to most of
+    /// the user's folders, so it saves into a staging directory and
+    /// `FileHandoff` moves the file on once it arrives.
+    func acceptFile(_ file: ProviderFile, directory: URL, replace: Bool = false) async {
         guard !isLoading, !isQuitting, receivingFileIDs.insert(file.transferId).inserted else { return }
         defer { receivingFileIDs.remove(file.transferId) }
         error = nil
+        let staging = await fileHandoff.stagingDirectory(for: directory, replace: replace)
         do {
             // Returns once the receive starts; status polling shows its progress.
             let response = try await TunnelIPC.request(ProviderRequest(action: .acceptFile, fileId: file.transferId,
-                                                                      directory: directory.path, uid: getuid(), gid: getgid()))
+                                                                      directory: staging.path, uid: getuid(), gid: getgid()))
             guard isConnected, !isQuitting else { return }
             status = response.status
+        } catch TunnelIPCError.provider(let message) {
+            await fileHandoff.forget(staging)
+            self.error = message
         } catch {
+            // A lost reply can leave a receive running with this destination.
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Move files the extension has finished saving to where they belong,
+    /// then show them there.
+    private func deliverReceivedFiles() {
+        guard deliveryTask == nil else { return }
+        deliveryTask = Task {
+            let pass = await fileHandoff.deliver()
+            deliveryTask = nil
+            deliveredFiles = pass.delivered
+            if let failure = pass.errors.first { error = failure }
+            if pass.movedAny { status = providerStatus }
         }
     }
 

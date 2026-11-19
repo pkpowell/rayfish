@@ -11,8 +11,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use anyhow::{Context, Result};
 #[cfg(test)]
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::dns::DnsResolver;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use iroh::dns::{DnsResolver, NameserverConfig};
+use iroh::dns::NameserverConfig;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{PkarrPublisher, PkarrResolver},
@@ -35,6 +36,7 @@ use std::sync::Arc;
 mod dns;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod dns_socket;
+mod encrypted_first;
 
 /// ALPN for the file-transfer protocol. Version 3 adds offer identities,
 /// receipt replies, and acknowledged decline notifications. Bump on a breaking
@@ -184,8 +186,8 @@ const MAX_CONTROL_PLANE_NAMESERVERS: usize = 4;
 /// there to bring up. `None` means the platform keeps its resolvers somewhere we
 /// cannot read (Android, Windows), which is a different thing from a host that
 /// has none: with nothing configured either, the answer is an empty list and the
-/// caller leaves iroh's own reader in place. Naming a public server there would
-/// step over Android's Private DNS and downgrade those lookups to cleartext.
+/// platform's own reader stays behind encrypted DNS. Naming a plain public
+/// server there would step over Android's Private DNS with cleartext.
 fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) -> Vec<IpAddr> {
     if system.is_none() && o.servers.is_empty() {
         return Vec::new();
@@ -215,6 +217,97 @@ fn control_plane_nameservers(o: &ServerOverride, system: Option<Vec<IpAddr>>) ->
     }
     out
 }
+
+/// The resolver for the endpoint's own names (the relay, the pkarr server).
+///
+/// Encrypted public DNS comes first and `nameservers` only when it fails; see
+/// [`encrypted_first`] for why plain DNS cannot go first or race it. Names
+/// under `local_names`, the configured relay and discovery hosts, ask
+/// `nameservers` first. With `replace`, the operator's servers are the only
+/// ones asked.
+///
+/// On Linux and macOS both tiers send from sockets kept off the exit tunnel,
+/// and name explicit servers instead of iroh's default, which reads resolv.conf
+/// at bind and keeps it for the endpoint's life: a resolv.conf that already
+/// points at our magic IP (a restart before the revert, a crash) would make
+/// the control plane wait on the data plane it exists to bring up. Elsewhere an
+/// empty list leaves the platform's own resolver behind encrypted DNS (Android
+/// reads it over JNI).
+fn control_plane_resolver(
+    nameservers: &[IpAddr],
+    dns_replace: bool,
+    local_names: Vec<String>,
+) -> Result<DnsResolver> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if dns_replace {
+            return dns::plain(nameservers);
+        }
+        let fallback = if nameservers.is_empty() {
+            DnsResolver::new()
+        } else {
+            dns::plain(nameservers)?
+        };
+        Ok(encrypted_first::resolver(
+            dns::encrypted()?,
+            fallback,
+            local_names,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let plain = DnsResolver::builder()
+            .add_nameserver_configs(nameservers.iter().copied().map(NameserverConfig::udp));
+        if dns_replace {
+            // Honour an explicit replacement even when every entry was an
+            // overlay address. DNS failure must not select a public resolver.
+            return Ok(plain.disable_fallback().build());
+        }
+        let fallback = if nameservers.is_empty() {
+            DnsResolver::new()
+        } else {
+            plain.build()
+        };
+        // HTTPS before TLS: the resolver starts the first few servers in this
+        // order, and a network that drops port 853 must not hold every slot.
+        let encrypted = PUBLIC_ENCRYPTED_DNS
+            .into_iter()
+            .map(NameserverConfig::https)
+            .chain(PUBLIC_ENCRYPTED_DNS.into_iter().map(NameserverConfig::tls));
+        let encrypted = DnsResolver::builder()
+            .add_nameserver_configs(encrypted)
+            .disable_fallback()
+            .build();
+        Ok(encrypted_first::resolver(encrypted, fallback, local_names))
+    }
+}
+
+/// The DNS names of the relay and discovery servers the operator configured.
+/// The `rayfish` presets are public names, so they stay encrypted-first.
+fn configured_hosts(relay: &ServerOverride, discovery: &ServerOverride) -> Vec<String> {
+    relay
+        .servers
+        .iter()
+        .chain(&discovery.servers)
+        .filter(|entry| entry.as_str() != "rayfish")
+        .filter_map(|entry| match url::Url::parse(entry).ok()?.host()? {
+            url::Host::Domain(name) => Some(name.to_owned()),
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+        })
+        .collect()
+}
+
+/// Public resolvers for encrypted DNS where hickory's server groups are not
+/// used. Their certificates name these addresses.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const PUBLIC_ENCRYPTED_DNS: [IpAddr; 6] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    IpAddr::V6(Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0, 0xfe)),
+];
 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
 /// When `tor` is true and the `tor` feature is enabled, adds the Tor custom transport
@@ -255,6 +348,7 @@ pub async fn create_endpoint_with_alpns(
         dns_replace: settings.dns_upstreams.replace,
         warm_lookup: &warm_lookup,
         quic_engine: settings.quic_engine,
+        quic_window: settings.quic_window_mib.bytes(),
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -289,6 +383,7 @@ struct BindConfig<'a> {
     dns_replace: bool,
     warm_lookup: &'a WarmLookup,
     quic_engine: QuicEngine,
+    quic_window: u64,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -313,6 +408,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         dns_replace,
         warm_lookup,
         quic_engine,
+        quic_window,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -340,7 +436,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     bounded send buffer. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
         // Both forwarding engines use loss-tolerant congestion control.
-        .transport_config(quic_transport_config(quic_engine))
+        .transport_config(quic_transport_config_with_window(quic_engine, quic_window))
         // Drop overlay addresses from the gathered direct-address candidates, so a
         // mesh IP bound on the TUN is never stored, published, or offered as a
         // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
@@ -348,35 +444,11 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         // so multi-homing / roaming is unaffected.
         .direct_addr_filter(OverlayAddrFilter);
 
-    // Resolve our own names (the relay, the pkarr server) against an explicit
-    // list instead of iroh's default, which reads the host's resolv.conf at bind
-    // and keeps it for the endpoint's life. Two things follow from that default:
-    // a host whose nameserver stopped answering takes the daemon's control plane
-    // with it, and a resolv.conf that already points at our magic IP (a restart
-    // before the revert, a crash) makes the control plane wait on the data plane
-    // it exists to bring up. Not setting `with_system_defaults` is deliberate:
-    // the resolver never reads the file, so neither can come back.
-    //
-    // An explicit replacement stays authoritative even when filtering removes
-    // every server. Otherwise the platform owns an empty resolver list.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if !nameservers.is_empty() || dns_replace {
-        builder = builder.dns_resolver(dns::resolver(nameservers, !dns_replace)?);
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    // Without an override, empty means the platform owns resolver selection
-    // (Android reads it over JNI and honours Private DNS). An explicit replace
-    // still applies when filtering leaves no usable servers.
-    if !nameservers.is_empty() || dns_replace {
-        let mut resolver = DnsResolver::builder()
-            .add_nameserver_configs(nameservers.iter().copied().map(NameserverConfig::udp));
-        if dns_replace {
-            // Honour an explicit replacement even when every entry was an
-            // overlay address. DNS failure must not select a public resolver.
-            resolver = resolver.disable_fallback();
-        }
-        builder = builder.dns_resolver(resolver.build());
-    }
+    builder = builder.dns_resolver(control_plane_resolver(
+        nameservers,
+        dns_replace,
+        configured_hosts(relay, discovery),
+    )?);
 
     // Loop prevention for the exit-node client full-tunnel: keep iroh's own sockets
     // (the underlay UDP sockets and the relay connection) off the default route that
@@ -534,6 +606,8 @@ fn is_unroutable(e: &io::Error) -> bool {
 
 const FQ_CODEL_SEND_BUFFER_SIZE: usize = 16 * 1024;
 const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 
 /// Mesh QUIC transmit policy, independent of TUN offload. iroh's address
 /// discovery client uses a separate transport configuration.
@@ -553,14 +627,26 @@ pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
 /// Starts from iroh's builder defaults (which carry the multipath / NAT-traversal
 /// / heartbeat settings required for holepunching) and only overrides the
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
+#[cfg(test)]
 pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
+    quic_transport_config_with_window(engine, crate::config::QuicWindowMiB::default().bytes())
+}
+
+fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> QuicTransportConfig {
     tracing::info!(
         engine = engine.as_ref(),
         mesh_quic_segmentation_offload = MESH_QUIC_SEGMENTATION_OFFLOAD,
+        max_window,
         "mesh QUIC transport config"
     );
     QuicTransportConfig::builder()
-        .congestion_controller_factory(Arc::new(LossTolerantConfig::default()))
+        .congestion_controller_factory(Arc::new(
+            LossTolerantConfig::default().with_max_window(max_window),
+        ))
+        // Reliable transfers need enough credit to fill high-bandwidth,
+        // high-latency paths without opening extra streams to gain credit.
+        .stream_receive_window(STREAM_RECEIVE_WINDOW.into())
+        .receive_window(CONNECTION_RECEIVE_WINDOW.into())
         // There are no competing data streams of equal priority, so disable
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
@@ -778,6 +864,29 @@ mod tests {
     /// network. Anything else and a restart that finds our own resolv.conf still
     /// in place waits on the data plane it is trying to bring up.
     #[test]
+    fn configured_hosts_are_custom_domain_names() {
+        let relay = ServerOverride {
+            servers: vec![
+                "rayfish".into(),
+                "https://relay.home.example".into(),
+                "http://192.0.2.7:3340".into(),
+            ],
+            replace: false,
+        };
+        let discovery = ServerOverride {
+            servers: vec![
+                "http://[2001:db8::1]:8080".into(),
+                "https://dns.home.example/pkarr".into(),
+            ],
+            replace: true,
+        };
+        assert_eq!(
+            configured_hosts(&relay, &discovery),
+            ["relay.home.example", "dns.home.example"]
+        );
+    }
+
+    #[test]
     fn control_plane_never_points_at_an_overlay_resolver() {
         let overlays: Vec<IpAddr> = [
             "100.100.100.53",
@@ -963,6 +1072,7 @@ mod tests {
             dns_replace: true,
             warm_lookup: &lookup,
             quic_engine: QuicEngine::default(),
+            quic_window: crate::config::QuicWindowMiB::default().bytes(),
         };
         timeout(Duration::from_secs(5), async {
             let endpoint = bind_endpoint(&bind, 0).await.unwrap();

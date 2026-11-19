@@ -33,6 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Check changelog
+        run: |
+          python3 scripts/changelog.py check
+          python3 tests/test-changelog.py
+
       - name: Test release version hook
         run: python3 tests/test-release-versions.py
 
@@ -205,7 +210,7 @@ jobs:
         run: brew install just fish
 
       - name: Test native app
-        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test
+        run: just macos-test macos-ipc-test macos-ui-test macos-notification-test macos-handoff-test
 
       - name: Check Apple bindings
         run: |
@@ -236,8 +241,7 @@ jobs:
   # The APK is built on release, which is too late: the Android half of the tree
   # is `#[cfg(target_os = "android")]` Rust plus generated Kotlin bindings, and
   # neither is compiled by the job above, so a PR could go green and break the
-  # tag build. This is the cheap version of that: no APK, no release link, no NDK
-  # download (the runner ships one), just the two things that actually broke.
+  # tag build. Compile the native target and test the app without producing an APK.
   android:
     runs-on: ubuntu-24.04
     steps:
@@ -260,18 +264,32 @@ jobs:
         with:
           tool: cargo-ndk
 
-      # The Android-only code paths (the VpnService TUN) compile nowhere else.
-      - name: Check the Android target
-        run: |
-          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          cargo ndk -t arm64-v8a check -p ray-mobile --locked
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+          key: android-ndk-27.2.12479018
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      # The Android-only code paths (the VpnService TUN) compile nowhere else.
+      - name: Check the Android target
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+        run: cargo ndk -t arm64-v8a check -p ray-mobile --locked
 
       - name: Regenerate the UniFFI bindings
         run: |

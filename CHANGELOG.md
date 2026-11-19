@@ -4,7 +4,41 @@ All notable changes to Rayfish are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.17] - 2026-11-19
+
+### Added
+
+- `ray config set tcp-congestion bbr` selects BBR for Linux mesh TCP routes
+  after restart, with the system policy retained when BBR is unavailable.
+- `ray config set quic-window-mib` controls the outer QUIC congestion-window
+  ceiling (1-256 MiB, default 16), independently of reliable-stream flow control.
+
+### Fixed
+
+- On Wi-Fi networks that rewrite DNS answers, such as some hotel or venue
+  filters, devices now join the mesh. Rayfish looks up its relays over
+  encrypted DNS first and uses the network's DNS only if that fails.
+
+- SSH: preserve command exit statuses before closing channels, avoiding
+  intermittent failures in reused connections and pipelined commands.
+
+- macOS: retry promptly when login starts the VPN before the network is ready,
+  instead of waiting 90 seconds after a failed start.
+
+- Prevent FQ-CoDel from reordering IPv6 fragments and causing packet loss
+  during large UDP transfers.
+
+- Linux with cgroup v2: keep Tailscale's system service from using the Rayfish
+  mesh as a direct transport path, without blocking other services that reuse
+  its packet mark.
+- Repeated background failures now back off and stop retrying, reducing battery use.
+
+- Keep complete packets when a tunnel's MTU is raised after startup.
+
+### Performance
+
+- Reliable transfers can use more bandwidth on high-latency paths without
+  opening extra QUIC streams.
 
 ## [0.5.16] - 2026-11-05
 
@@ -3343,7 +3377,6 @@ First public release.
 - **Optional transports / export**: `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.5.14...HEAD
 [0.5.14]: https://github.com/rayfish/rayfish/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/rayfish/rayfish/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/rayfish/rayfish/compare/v0.5.11...v0.5.12

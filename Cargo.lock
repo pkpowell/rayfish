@@ -6330,6 +6330,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "iroh",
+ "libc",
  "rayfish",
  "tempfile",
  "thiserror 2.0.20",
@@ -6406,7 +6407,7 @@ dependencies = [
 
 [[package]]
 name = "rayfish"
-version = "0.5.16"
+version = "0.5.17"
 dependencies = [
  "ahash",
  "anyhow",
