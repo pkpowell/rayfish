@@ -19,7 +19,10 @@ use iroh::{
     address_lookup::{PkarrPublisher, PkarrResolver},
     endpoint::Connection,
     endpoint::presets,
-    endpoint::{BindOpts, Builder, DirectAddrFilter, QuicTransportConfig, SocketConfigurator},
+    endpoint::{
+        BindOpts, Builder, DefaultNetworkMonitor, NetworkChange, NetworkMonitor, NetworkState,
+        QuicTransportConfig, SocketConfigurator,
+    },
 };
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
@@ -363,6 +366,7 @@ pub(crate) async fn create_endpoint_with_discovery(
         warm_lookup: &warm_lookup,
         quic_engine: settings.quic_engine,
         quic_window: settings.quic_window_mib.bytes(),
+        mesh_offload: settings.mesh_quic_offload_enabled(),
     };
     let ep = match bind_endpoint(&bind, RAYFISH_LISTEN_PORT).await {
         Ok(ep) => ep,
@@ -399,6 +403,7 @@ struct BindConfig<'a> {
     warm_lookup: &'a WarmLookup,
     quic_engine: QuicEngine,
     quic_window: u64,
+    mesh_offload: bool,
 }
 
 /// Builds and binds an iroh endpoint on `port` with the N0 preset and (when
@@ -425,6 +430,7 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         warm_lookup,
         quic_engine,
         quic_window,
+        mesh_offload,
     } = *cfg;
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::N0)
@@ -445,20 +451,25 @@ async fn bind_endpoint(cfg: &BindConfig<'_>, port: u16) -> Result<Endpoint> {
         //     to round-robin, so fairness scheduling is pure overhead. (Affects
         //     stream scheduling only, not datagrams, but is the correct setting and
         //     removes a small amount of per-packet work.)
-        //   - QUIC segmentation offload is disabled on Linux until failed GSO
-        //     sends recover on existing connections. Other platforms keep GSO
-        //     to coalesce same-destination segments into one sendmsg.
+        //   - QUIC segmentation offload coalesces same-destination segments
+        //     into one sendmsg. When the kernel refuses a GSO send, the socket
+        //     falls back to single datagrams for every connection on it.
         //   - Datagrams enabled (iroh/noq default `Some` receive buffer), with a
         //     bounded send buffer. The forwarding path never waits for capacity;
         //     when the queue is full, noQ discards older datagrams.
         // Both forwarding engines use loss-tolerant congestion control.
-        .transport_config(quic_transport_config_with_window(quic_engine, quic_window))
-        // Drop overlay addresses from the gathered direct-address candidates, so a
-        // mesh IP bound on the TUN is never stored, published, or offered as a
-        // holepunch / NAT-traversal candidate (and so never dialed by a peer, which
-        // would loop the underlay back through the tunnel). Stays bound to `0.0.0.0`,
-        // so multi-homing / roaming is unaffected.
-        .direct_addr_filter(OverlayAddrFilter);
+        .transport_config(quic_transport_config_with_window(
+            quic_engine,
+            quic_window,
+            mesh_offload,
+        ))
+        // Hide overlay and unroutable addresses from iroh's view of the local
+        // network, so a mesh IP bound on the TUN is never published, offered as a
+        // holepunch candidate, or kept as a path after a network change (and so
+        // never dialed by a peer, which would loop the underlay back through the
+        // tunnel). Stays bound to `0.0.0.0`, so multi-homing / roaming is
+        // unaffected.
+        .network_monitor(UnderlayMonitor::new().await?);
 
     builder = builder.dns_resolver(control_plane_resolver(
         nameservers,
@@ -526,33 +537,133 @@ fn is_foreign_overlay_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// A [`DirectAddrFilter`] that drops rayfish overlay addresses (`100.64.0.0/10`,
-/// `200::/7`) from iroh's gathered direct-address candidates. The mesh IP is bound
-/// on the TUN device; without this iroh would discover it, advertise it (pkarr/DNS
-/// and in-band NAT-traversal), and peers would dial it, looping the underlay back
-/// through the tunnel we carry.
+/// A [`NetworkMonitor`] that hides rayfish overlay addresses (`200::/7`) and
+/// `100.64.0.0/10` from iroh. The mesh IP is bound on the TUN device; without this
+/// iroh would discover it, advertise it (pkarr/DNS and in-band NAT-traversal), and
+/// peers would dial it, looping the underlay back through the tunnel we carry.
 ///
-/// Another VPN's overlay is dropped too. A host running rayfish alongside
+/// Another VPN's overlay is hidden too. A host running rayfish alongside
 /// Tailscale would otherwise publish its tailnet address in a public pkarr
 /// record: it names a network no rayfish peer can route to, and it leaks the
 /// fact (and address) of that tailnet to anyone who reads the record.
 ///
-/// A *global* candidate whose family this host cannot currently route goes too. A
+/// A *global* address whose family this host cannot currently route goes too. A
 /// co-resident VPN that takes one family down (Mullvad with IPv6 disabled removes
 /// the v6 default, and every v6 send then fails with `EHOSTUNREACH`) leaves the
 /// addresses of that family bound and discoverable, so without this we keep
 /// publishing them and peers keep dialling them: each dial opens a path we cannot
 /// answer on, it closes, and the pair churns for as long as the VPN is up.
+///
+/// The monitor is iroh's only view of local addresses, so a hidden address is
+/// also out of path recovery after a network change. It does not see addresses
+/// iroh learns elsewhere: QAD reflexive addresses, port mappings, and configured
+/// external addresses.
+///
+/// The default monitor only reports a change when the interface state differs,
+/// and losing only the v6 default route (the Mullvad case) is not one. So the
+/// routability probe also runs every [`EGRESS_RECHECK`] and on
+/// [`Endpoint::network_change`], which rayfish calls when it changes routing
+/// itself, and a change is emitted when the filtered state differs.
 #[derive(Debug)]
-struct OverlayAddrFilter;
+struct UnderlayMonitor {
+    inner: DefaultNetworkMonitor,
+    recheck: tokio::sync::watch::Sender<()>,
+}
 
-impl DirectAddrFilter for OverlayAddrFilter {
-    fn keeps(&self, ip: IpAddr) -> bool {
-        keeps_addr(ip, family_can_egress)
+/// How often the routability probe runs without a network change. iroh re-ran
+/// the old direct address filter on its periodic re-stun, every 20 to 26 seconds.
+const EGRESS_RECHECK: std::time::Duration = std::time::Duration::from_secs(20);
+
+impl UnderlayMonitor {
+    async fn new() -> Result<Self> {
+        let inner = DefaultNetworkMonitor::new()
+            .await
+            .context("failed to watch the local network")?;
+        Ok(Self {
+            inner,
+            recheck: tokio::sync::watch::channel(()).0,
+        })
     }
 }
 
-/// The filter's decision, with the routability probe passed in so it can be tested
+impl NetworkMonitor for UnderlayMonitor {
+    fn state(&self) -> NetworkState {
+        underlay_state(self.inner.state(), family_can_egress)
+    }
+
+    fn changes(&self) -> futures::stream::BoxStream<'static, NetworkChange> {
+        use futures::StreamExt;
+        use tokio::time::{Instant, MissedTickBehavior, interval_at};
+
+        struct Changes {
+            inner: DefaultNetworkMonitor,
+            changes: futures::stream::BoxStream<'static, NetworkChange>,
+            recheck: tokio::sync::watch::Receiver<()>,
+            ticks: tokio::time::Interval,
+            last: NetworkState,
+        }
+
+        let mut ticks = interval_at(Instant::now() + EGRESS_RECHECK, EGRESS_RECHECK);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let changes = Changes {
+            changes: self.inner.changes(),
+            last: self.state(),
+            inner: self.inner.clone(),
+            recheck: self.recheck.subscribe(),
+            ticks,
+        };
+        futures::stream::unfold(changes, |mut c| async move {
+            loop {
+                let (mut change, from_inner) = tokio::select! {
+                    change = c.changes.next() => (change?, true),
+                    _ = c.ticks.tick() => (NetworkChange::new(c.inner.state(), false), false),
+                    Ok(()) = c.recheck.changed() => {
+                        (NetworkChange::new(c.inner.state(), false), false)
+                    }
+                };
+                change.state = underlay_state(change.state, family_can_egress);
+                // A change from the default monitor is always passed on, a recheck
+                // only when it found something different.
+                if from_inner || change.state != c.last {
+                    c.last = change.state.clone();
+                    return Some((change, c));
+                }
+            }
+        })
+        .boxed()
+    }
+
+    fn network_change(&self) -> futures::future::BoxFuture<'static, ()> {
+        let inner = self.inner.network_change();
+        let recheck = self.recheck.clone();
+        Box::pin(async move {
+            inner.await;
+            recheck.send_replace(());
+        })
+    }
+}
+
+/// `state` with the addresses [`keeps_addr`] rejects removed.
+///
+/// A family whose global addresses were dropped as unroutable is also marked
+/// absent, so iroh stops probing it with QAD. Nothing else lowers the flags: a
+/// host whose only v4 address is a carrier `100.64.0.0/10` one still reaches the
+/// internet over v4, and QAD is what finds its public address.
+fn underlay_state(mut state: NetworkState, can_egress: impl Fn(IpAddr) -> bool) -> NetworkState {
+    let mut v4 = None;
+    let mut v6 = None;
+    state.addrs.retain(|addr| {
+        keeps_addr(addr.ip, |ip| {
+            let verdict = if ip.is_ipv4() { &mut v4 } else { &mut v6 };
+            *verdict.get_or_insert_with(|| can_egress(ip))
+        })
+    });
+    state.have_v4 &= v4 != Some(false);
+    state.have_v6 &= v6 != Some(false);
+    state
+}
+
+/// Whether an address stays visible to iroh, with the routability probe passed in so it can be tested
 /// without depending on the host's routing table, and so it runs only when the
 /// answer can matter.
 fn keeps_addr(ip: IpAddr, can_egress: impl FnOnce(IpAddr) -> bool) -> bool {
@@ -582,10 +693,8 @@ const PROBE_DST_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
 /// Whether this host can currently route `ip`'s family off-link.
 ///
-/// The question has to be asked per family rather than per address: `keeps` is
-/// handed local interface addresses *and* the reflexive addresses QAD discovered
-/// for us, and the latter are not bound here, so a bind-and-connect test would
-/// reject exactly the public candidates that matter.
+/// The question is asked per family rather than per address, so one probe
+/// answers for every global address of that family.
 ///
 /// The probe carries [`LoopPrevention`] because iroh's own sockets do. Without it
 /// the lookup consults a different routing table than the transport actually uses
@@ -623,14 +732,15 @@ fn is_unroutable(e: &io::Error) -> bool {
     )
 }
 
-const FQ_CODEL_SEND_BUFFER_SIZE: usize = 16 * 1024;
+/// The FQ-CoDel scheduler fills only part of this; see `forward::fq_codel`.
+const FQ_CODEL_SEND_BUFFER_SIZE: usize = if cfg!(target_os = "linux") {
+    256 * 1024
+} else {
+    16 * 1024
+};
 const STANDALONE_SEND_BUFFER_SIZE: usize = 1024 * 1024;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
-
-/// Mesh QUIC transmit policy, independent of TUN offload. iroh's address
-/// discovery client uses a separate transport configuration.
-pub(crate) const MESH_QUIC_SEGMENTATION_OFFLOAD: bool = !cfg!(target_os = "linux");
 
 /// Keep FQ-CoDel's backlog in its scheduler and allow standalone traffic bursts.
 pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
@@ -648,13 +758,21 @@ pub(crate) fn datagram_send_buffer_size(engine: QuicEngine) -> usize {
 /// datagram-relevant knobs. See `bind_endpoint` for the rationale.
 #[cfg(test)]
 pub(crate) fn quic_transport_config(engine: QuicEngine) -> QuicTransportConfig {
-    quic_transport_config_with_window(engine, crate::config::QuicWindowMiB::default().bytes())
+    quic_transport_config_with_window(
+        engine,
+        crate::config::QuicWindowMiB::default().bytes(),
+        AppConfig::default().mesh_quic_offload_enabled(),
+    )
 }
 
-fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> QuicTransportConfig {
+fn quic_transport_config_with_window(
+    engine: QuicEngine,
+    max_window: u64,
+    mesh_offload: bool,
+) -> QuicTransportConfig {
     tracing::info!(
         engine = engine.as_ref(),
-        mesh_quic_segmentation_offload = MESH_QUIC_SEGMENTATION_OFFLOAD,
+        mesh_quic_segmentation_offload = mesh_offload,
         max_window,
         "mesh QUIC transport config"
     );
@@ -670,11 +788,11 @@ fn quic_transport_config_with_window(engine: QuicEngine, max_window: u64) -> Qui
         // round-robin fairness scheduling. This removes overhead from the few
         // reliable control streams; DATAGRAM frames are scheduled separately.
         .send_fairness(false)
-        // After a GSO send fails, existing iroh connections can keep using it
-        // and stall on Linux: https://github.com/n0-computer/iroh/issues/4555
-        // Disable it for mesh connections until fallback recovers. iroh-relay's
-        // address-discovery client builds its own default transport config.
-        .enable_segmentation_offload(MESH_QUIC_SEGMENTATION_OFFLOAD)
+        // Linux before 6.11 refuses GSO sends when the NIC lacks TX checksum
+        // offload. noq-udp then drops the socket to one datagram per send, and
+        // the patched iroh reads that limit on every transmit, so open
+        // connections fall back too (n0-computer/iroh#4555).
+        .enable_segmentation_offload(mesh_offload)
         // When this bounded queue fills, noQ discards older datagrams rather
         // than making the forwarding path wait behind stale traffic.
         .datagram_send_buffer_size(datagram_send_buffer_size(engine))
@@ -820,6 +938,61 @@ mod tests {
         // reasons to drop one are independent.
         let overlay: IpAddr = "200::1".parse().unwrap();
         assert!(!keeps_addr(overlay, |_| true));
+    }
+
+    fn state_with(addrs: &[&str]) -> NetworkState {
+        let mut state = NetworkState::default();
+        state.addrs = addrs
+            .iter()
+            .map(|a| iroh::endpoint::LocalAddr::new(a.parse().unwrap()))
+            .collect();
+        state.has_default_route = true;
+        state.have_v4 = true;
+        state.have_v6 = true;
+        state
+    }
+
+    fn ips(state: &NetworkState) -> Vec<String> {
+        state.addrs.iter().map(|a| a.ip.to_string()).collect()
+    }
+
+    /// iroh sees the filtered addresses, and a family the probe calls
+    /// unroutable is reported absent, probed once however many addresses it has.
+    #[test]
+    fn underlay_state_hides_addresses_and_unroutable_families() {
+        let probes = std::cell::Cell::new(0);
+        let state = underlay_state(
+            state_with(&[
+                "51.15.139.151",
+                "192.168.1.104",
+                "2a02:6ea0:c318:2::e023",
+                "2a02:6ea0:c318:2::1",
+                "fd00:1234:5678::1",
+                "200::1",
+            ]),
+            |ip| {
+                probes.set(probes.get() + 1);
+                ip.is_ipv4()
+            },
+        );
+        assert_eq!(
+            ips(&state),
+            ["51.15.139.151", "192.168.1.104", "fd00:1234:5678::1"]
+        );
+        assert!(state.have_v4);
+        assert!(!state.have_v6);
+        assert_eq!(probes.get(), 2);
+    }
+
+    /// Hiding a carrier `100.64.0.0/10` address must not mark v4 absent: the
+    /// host still reaches the internet over it, and v4 QAD finds its public
+    /// address.
+    #[test]
+    fn underlay_state_keeps_the_family_of_a_hidden_cgnat_address() {
+        let state = underlay_state(state_with(&["100.124.253.88"]), |_| true);
+        assert!(state.addrs.is_empty());
+        assert!(state.have_v4);
+        assert!(state.have_v6);
     }
 
     /// The probe answers a question about reaching the internet, so it must not
@@ -1093,6 +1266,7 @@ mod tests {
             warm_lookup: &lookup,
             quic_engine: QuicEngine::default(),
             quic_window: crate::config::QuicWindowMiB::default().bytes(),
+            mesh_offload: AppConfig::default().mesh_quic_offload_enabled(),
         };
         timeout(Duration::from_secs(5), async {
             let endpoint = bind_endpoint(&bind, 0).await.unwrap();
